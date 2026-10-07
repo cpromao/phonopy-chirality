@@ -1,0 +1,9 @@
+# plot_chiral_bands.py
+numpy>=1.24
+matplotlib>=3.7
+h5py>=3.8
+pyyaml>=6.0       # band.yaml input only; install libyaml for the fast C parser
+
+# Generating input (optional)
+# phonopy>=2.20
+# seekpath>=2.0   # for the band-path helper in the README

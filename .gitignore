@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Phonopy and calculation files (large, structure-specific)
+results/
+phonopy*.yaml
+FORCE_SETS
+FORCE_CONSTANTS
+force_constants.hdf5
+*.conf
+POSCAR*
+*.vasp
+*.poscar
+*.cif
+*.hdf5
+*.h5
+band.yaml
+mesh.yaml
+*.npz
+
+# Figures and data produced by the plotting script
+*.png
+*.pdf
+*.csv
+
+# SLURM
+slurm-*.out
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
