@@ -15,15 +15,15 @@ $$
 
 where $(d, d_1, d_2)$ is a cyclic permutation of $(x, y, z)$. In units of $\hbar$, $\|\mathbf{J}\| \le 1$ for any normalized mode, with the bound reached when every atom revolves coherently in a single plane. Within a degenerate subspace the individual eigenvectors are fixed only up to a unitary rotation, which makes the per-mode angular momentum gauge-dependent; by default these modes are therefore set to zero (`--no-degen-zero` disables this).
 
-The chirality-resolved DOS weights each mode by the same Gaussian that builds the DOS,
+The DOS is drawn as a histogram whose bars are filled with the mean angular momentum of the modes they contain. For bin $b$ of width $\Delta\omega_b$,
 
 $$
-\langle J \rangle(\omega) =
-\frac{\sum_{\mathbf{q}\nu} w_\mathbf{q}\, G_\sigma(\omega - \omega_{\mathbf{q}\nu})\, \|\mathbf{J}_{\mathbf{q}\nu}\|}
-     {\sum_{\mathbf{q}\nu} w_\mathbf{q}\, G_\sigma(\omega - \omega_{\mathbf{q}\nu})},
+g_b = \frac{1}{\Delta\omega_b} \sum_{\mathbf{q}\nu \in b} w_\mathbf{q},
+\qquad
+\langle J \rangle_b = \frac{\sum_{\mathbf{q}\nu \in b} w_\mathbf{q}\, \|\mathbf{J}_{\mathbf{q}\nu}\|}{\sum_{\mathbf{q}\nu \in b} w_\mathbf{q}},
 $$
 
-so the colour at each frequency is the average over exactly the modes contributing to the DOS there.
+where $w_\mathbf{q}$ are the q-point weights, normalized to sum to one, so that the bars integrate to the number of modes per cell. Only $\|\mathbf{J}\|$ gives a meaningful DOS colouring: in a non-magnetic crystal $\mathbf{J}(-\mathbf{q}) = -\mathbf{J}(\mathbf{q})$ by time-reversal symmetry, so a signed component averages to zero over the zone, and on a symmetry-reduced mesh depends on which of $\pm\mathbf{q}$ is stored. The script warns when a signed component is combined with a DOS.
 
 ## Installation
 
@@ -184,8 +184,9 @@ Data-driven limits are ignored when the angular momentum is below $10^{-6}\,\hba
 | `--no-sort-freq` | off | Keep Phonopy's band connection instead of sorting modes by frequency at each q-point |
 | `--dos`, `--dos-only` | off | DOS side panel, or a DOS-only figure |
 | `--mesh MESH_HDF5` | auto | Mesh file for the DOS |
-| `--dos-sigma`, `--dos-bins` | auto, 601 | Gaussian smearing and grid size |
-| `--dos-out CSV` | – | Write frequency, DOS and mean chirality to CSV |
+| `--dos-bins N` | 150 | Number of histogram bins across the frequency range (the `--ylim` window if given) |
+| `--dos-binwidth W` | – | Bin width in the chosen frequency unit; overrides `--dos-bins` |
+| `--dos-out CSV` | – | Write bin edges, DOS and mean chirality per bin to CSV |
 | `--no-degen-zero`, `--degen-tol` | off, 1e-5 | Degeneracy handling |
 | `--fontsize`, `--linewidth`, `--dpi` | 16, 1.5, 300 | Figure styling |
 | `--no-cache` | off | Do not read or write the `band.yaml.npz` cache |

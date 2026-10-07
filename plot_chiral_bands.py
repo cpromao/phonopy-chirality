@@ -501,96 +501,93 @@ def sort_modes_by_frequency(
     return f_sorted, chi_sorted, chit_sorted, S_sorted
 
 
-def compute_chirality_dos(
+def compute_chirality_histogram(
     frequencies: np.ndarray,
     color_values: np.ndarray,
     weights: np.ndarray | None = None,
     *,
-    nbins: int = 601,
-    sigma: float | None = None,
-    fmin: float | None = None,
-    fmax: float | None = None,
+    nbins: int = 150,
+    binwidth: float | None = None,
+    frange: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    r"""Gaussian-smeared phonon DOS plus the DOS-weighted mean of a per-mode value.
+    r"""Phonon DOS as a histogram, with the mean of a per-mode value in each bin.
 
-    The density of states is the usual smeared mode count
-
-    .. math::
-        g(\omega) = \sum_{\mathbf q\nu} w_{\mathbf q}\,
-                     G_\sigma(\omega - \omega_{\mathbf q\nu})
-
-    and alongside it we accumulate the same sum weighted by each mode's
-    angular momentum, so that
+    Each mode contributes its q-point weight :math:`w_{\mathbf q}` (normalized
+    so that :math:`\sum_{\mathbf q} w_{\mathbf q} = 1`) to the bin containing
+    its frequency, giving
 
     .. math::
-        \langle X \rangle(\omega) = \frac{\sum_{\mathbf q\nu} w_{\mathbf q}\,
-            G_\sigma(\omega - \omega_{\mathbf q\nu})\, X_{\mathbf q\nu}}
-            {g(\omega)}
+        g_b = \frac{1}{\Delta\omega_b} \sum_{\mathbf q\nu \in b} w_{\mathbf q},
+        \qquad
+        \langle X \rangle_b = \frac{\sum_{\mathbf q\nu \in b} w_{\mathbf q}\, X_{\mathbf q\nu}}
+                                   {\sum_{\mathbf q\nu \in b} w_{\mathbf q}},
 
-    i.e. at each frequency the average is taken over exactly the modes that
-    contribute to the DOS there, with the same Gaussian weights. Where the
-    DOS is negligible the average is undefined and is returned as 0.
+    so :math:`\sum_b g_b \Delta\omega_b` is the number of modes per cell in
+    the binned range, and :math:`\langle X\rangle_b` averages over exactly the
+    modes that make up bar :math:`b`.
 
     Parameters
     ----------
     frequencies  : (nqpt, nband)  mode frequencies
     color_values : (nqpt, nband)  per-mode quantity to average (e.g. |J|)
     weights      : (nqpt,) or None   q-point symmetry weights (None -> uniform)
-    nbins        : number of points on the frequency grid
-    sigma        : Gaussian smearing width in the same unit as ``frequencies``.
-                   Defaults to 1.5 grid spacings.
-    fmin, fmax   : frequency grid limits (default: data range plus a margin)
+    nbins        : number of bins across ``frange`` (ignored if ``binwidth``)
+    binwidth     : bin width in the unit of ``frequencies``
+    frange       : (fmin, fmax) to bin; default is the full frequency range
 
     Returns
     -------
-    grid    : (nbins,)  frequency grid
-    dos     : (nbins,)  density of states (normalized so that the integral
-              equals the total number of modes per unit cell)
-    avg_val : (nbins,)  DOS-weighted mean of ``color_values``
+    edges : (nb + 1,)  bin edges
+    dos   : (nb,)      density of states, states per unit frequency per cell
+    mean  : (nb,)      weighted mean of ``color_values`` (NaN for empty bins)
     """
     freqs = np.asarray(frequencies, dtype=float)
     vals = np.asarray(color_values, dtype=float)
-    nqpt, nband = freqs.shape
+    nqpt = freqs.shape[0]
 
-    if weights is None:
-        w = np.ones(nqpt, dtype=float)
+    w = np.ones(nqpt) if weights is None else np.asarray(weights, dtype=float)
+    w = np.broadcast_to((w / w.sum())[:, None], freqs.shape)
+
+    lo, hi = (float(freqs.min()), float(freqs.max())) if frange is None \
+        else (float(min(frange)), float(max(frange)))
+    if hi <= lo:
+        hi = lo + 1.0
+    if binwidth is not None and binwidth > 0:
+        n = max(1, int(np.ceil((hi - lo) / binwidth - 1e-9)))
+        edges = lo + binwidth * np.arange(n + 1)
     else:
-        w = np.asarray(weights, dtype=float)
-    w = w / w.sum()            # normalize so the DOS integrates to nband
+        edges = np.linspace(lo, hi, max(1, int(nbins)) + 1)
 
-    if fmin is None:
-        fmin = float(freqs.min())
-    if fmax is None:
-        fmax = float(freqs.max())
-    span = fmax - fmin if fmax > fmin else 1.0
-    fmin -= 0.02 * span
-    fmax += 0.02 * span
+    counts, _ = np.histogram(freqs.ravel(), bins=edges, weights=w.ravel())
+    acc, _ = np.histogram(freqs.ravel(), bins=edges, weights=(w * vals).ravel())
+    dos = counts / np.diff(edges)
+    mean = np.full(counts.shape, np.nan)
+    filled = counts > 0
+    mean[filled] = acc[filled] / counts[filled]
+    return edges, dos, mean
 
-    grid = np.linspace(fmin, fmax, nbins)
-    if sigma is None:
-        sigma = 1.5 * (grid[1] - grid[0])
 
-    dos = np.zeros(nbins)
-    acc = np.zeros(nbins)      # sum of Gaussian * value
+def _draw_chirality_histogram(ax, edges, dos, mean, cmap, norm, *, horizontal):
+    """Draw the DOS histogram with each bar filled by its mean chirality.
 
-    # Broadcast per q-point to keep peak memory modest for large meshes
-    inv = 1.0 / (sigma * np.sqrt(2.0 * np.pi))
-    for iq in range(nqpt):
-        d = grid[:, None] - freqs[iq][None, :]           # (nbins, nband)
-        g = inv * np.exp(-0.5 * (d / sigma) ** 2)
-        g *= w[iq]
-        dos += g.sum(axis=1)
-        acc += (g * vals[iq][None, :]).sum(axis=1)
-
-    # Weighted mean: acc / dos, taken BEFORE any rescaling of dos (the
-    # normalisation factor cancels in the ratio anyway, but doing it here
-    # keeps the guard threshold meaningful).
-    thresh = 1e-10 * dos.max() if dos.max() > 0 else 0.0
-    avg_val = np.zeros(nbins)
-    good = dos > thresh
-    avg_val[good] = acc[good] / dos[good]
-
-    return grid, dos, avg_val
+    A thin dark outline traces the DOS envelope, so bins whose colour is
+    close to the background (e.g. J ~ 0 with a diverging colormap) stay
+    visible.
+    """
+    cmap = plt.get_cmap(cmap)
+    t = np.ma.filled(np.ma.masked_invalid(np.ma.asarray(norm(np.nan_to_num(mean)),
+                                                         dtype=float)), 0.0)
+    colours = cmap(np.clip(t, 0.0, 1.0))
+    keep = dos > 0
+    lo, width = edges[:-1][keep], np.diff(edges)[keep]
+    style = dict(align="edge", color=colours[keep], edgecolor=colours[keep],
+                 linewidth=0.3, zorder=2)
+    if horizontal:
+        ax.barh(lo, dos[keep], height=width, **style)
+    else:
+        ax.bar(lo, dos[keep], width=width, **style)
+    ax.stairs(dos, edges, orientation="horizontal" if horizontal else "vertical",
+              color="0.25", linewidth=0.6, zorder=3)
 
 
 # --------------------------------------------------------------------------- #
@@ -809,10 +806,10 @@ def plot_band_chirality(
 ):
     """Render the band structure, coloring each band by ``color_values``.
 
-    If ``dos`` is given it must be a ``(grid, dos_values, avg_color)`` tuple
-    as returned by :func:`compute_chirality_dos`; it is drawn as a side panel
-    sharing the frequency axis, with the DOS curve coloured by the
-    DOS-weighted mean angular momentum at each frequency.
+    If ``dos`` is given it must be an ``(edges, dos, mean)`` tuple as
+    returned by :func:`compute_chirality_histogram`; it is drawn as a
+    histogram side panel sharing the frequency axis, each bar filled with the
+    mean angular momentum of the modes in it.
     """
     nqpt, nband = frequencies.shape
 
@@ -876,17 +873,9 @@ def plot_band_chirality(
 
     # DOS side panel, coloured by the DOS-weighted mean angular momentum
     if ax_dos is not None:
-        grid, dos_vals, dos_col = dos
-        # Light grey fill gives the eye the DOS shape; the coloured line on
-        # top carries the angular-momentum information.
-        ax_dos.fill_betweenx(grid, 0, dos_vals, color="0.88", zorder=1)
-        pts = np.column_stack([dos_vals, grid]).reshape(-1, 1, 2)
-        segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
-        seg_c = 0.5 * (dos_col[:-1] + dos_col[1:])
-        lc = LineCollection(segs, cmap=cmap, norm=norm,
-                            linewidths=max(linewidth, 1.8), zorder=2)
-        lc.set_array(seg_c)
-        ax_dos.add_collection(lc)
+        edges, dos_vals, dos_col = dos
+        _draw_chirality_histogram(ax_dos, edges, dos_vals, dos_col, cmap, norm,
+                                  horizontal=True)
 
         ax_dos.set_xlim(0, float(np.max(dos_vals)) * 1.08 or 1.0)
         ax_dos.set_xlabel(dos_label, fontsize=fontsize)
@@ -913,6 +902,26 @@ def plot_band_chirality(
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def _warn_signed_dos(args):
+    """Signed J components carry no information in a DOS of a non-magnetic crystal."""
+    if args.component != "total":
+        print(f"  ⚠️ J_{args.component} is odd under time reversal, J(-q) = -J(q), "
+              f"so its DOS average vanishes over the full zone (and on a "
+              f"symmetry-reduced mesh depends on which of ±q is stored); the "
+              f"DOS is only meaningful for --component total")
+
+
+def _write_dos_csv(path, edges, dos_vals, mean, args, source):
+    """Write the DOS histogram: bin edges, DOS and mean chirality per bin."""
+    comp = "J" if args.component == "total" else "J" + args.component
+    hdr = (f"bin_lo[{args.unit}],bin_hi[{args.unit}],"
+           f"dos[states/{args.unit}/cell],mean_{comp}[hbar]  "
+           f"({source}-derived; mean is nan for empty bins)")
+    np.savetxt(path, np.column_stack([edges[:-1], edges[1:], dos_vals, mean]),
+               delimiter=",", header=hdr, comments="# ")
+    print(f"Saved DOS data to {path}")
+
+
 def _dos_only_main(args):
     """Produce a standalone chirality-coloured DOS figure from a q-mesh."""
     mesh = load_mesh_file(args.mesh)
@@ -947,28 +956,19 @@ def _dos_only_main(args):
                      signed=signed)
     print(f"  colour range: [{vmin:.4g}, {vmax:.4g}]  scale={args.cscale}")
 
-    grid, dos_vals, dos_col = compute_chirality_dos(
-        freqs, color, mesh["weights"],
-        nbins=args.dos_bins, sigma=args.dos_sigma,
+    _warn_signed_dos(args)
+    edges, dos_vals, dos_col = compute_chirality_histogram(
+        freqs, color, mesh["weights"], nbins=args.dos_bins,
+        binwidth=args.dos_binwidth, frange=args.ylim,
     )
-
     if args.dos_out:
-        hdr = (f"frequency[{args.unit}],dos[states/{args.unit}/cell],"
-               f"mean_chirality[hbar]  (mesh-derived)")
-        np.savetxt(args.dos_out, np.column_stack([grid, dos_vals, dos_col]),
-                   delimiter=",", header=hdr, comments="# ")
-        print(f"Saved DOS data to {args.dos_out}")
+        _write_dos_csv(args.dos_out, edges, dos_vals, dos_col, args, "mesh")
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    ax.fill_between(grid, 0, dos_vals, color="0.88", zorder=1)
-    pts = np.column_stack([grid, dos_vals]).reshape(-1, 1, 2)
-    segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
-    lc = LineCollection(segs, cmap=cmap, norm=norm,
-                        linewidths=max(args.linewidth, 2.0), zorder=2)
-    lc.set_array(0.5 * (dos_col[:-1] + dos_col[1:]))
-    ax.add_collection(lc)
+    _draw_chirality_histogram(ax, edges, dos_vals, dos_col, cmap, norm,
+                              horizontal=False)
 
-    ax.set_xlim(args.ylim if args.ylim else (grid.min(), grid.max()))
+    ax.set_xlim(args.ylim if args.ylim else (edges[0], edges[-1]))
     ax.set_ylim(0, float(np.max(dos_vals)) * 1.08 or 1.0)
     ax.set_xlabel(f"Frequency [{args.unit}]", fontsize=args.fontsize)
     ax.set_ylabel(f"DOS [states/{args.unit}/cell]", fontsize=args.fontsize)
@@ -1060,11 +1060,12 @@ def main(argv=None):
                         "without it the DOS is built from the band-path "
                         "q-points only, which samples high-symmetry lines "
                         "rather than the whole zone.")
-    p.add_argument("--dos-sigma", type=float, default=None,
-                   help="Gaussian smearing width for the DOS, in the plot's "
-                        "frequency unit (default: 1.5 grid spacings).")
-    p.add_argument("--dos-bins", type=int, default=601,
-                   help="Number of frequency grid points for the DOS.")
+    p.add_argument("--dos-bins", type=int, default=150,
+                   help="Number of DOS histogram bins across the frequency "
+                        "range (the --ylim window if given). Default 150.")
+    p.add_argument("--dos-binwidth", type=float, default=None,
+                   help="DOS histogram bin width in the plot's frequency "
+                        "unit; overrides --dos-bins.")
     p.add_argument("--dos-only", action="store_true",
                    help="Plot only the chirality-coloured DOS (no band "
                         "panel). Implied when a mesh.hdf5 is given as the "
@@ -1197,20 +1198,15 @@ def main(argv=None):
             dos_weights = None
             dos_source = "path"
 
-        grid, dos_vals, dos_col = compute_chirality_dos(
-            dos_freqs, m_color, dos_weights,
-            nbins=args.dos_bins, sigma=args.dos_sigma,
+        _warn_signed_dos(args)
+        edges, dos_vals, dos_col = compute_chirality_histogram(
+            dos_freqs, m_color, dos_weights, nbins=args.dos_bins,
+            binwidth=args.dos_binwidth, frange=args.ylim,
         )
-        dos_tuple = (grid, dos_vals, dos_col)
-
+        dos_tuple = (edges, dos_vals, dos_col)
         if args.dos_out:
-            hdr = (f"frequency[{args.unit}],dos[states/{args.unit}/cell],"
-                   f"mean_{'J' if args.component == 'total' else 'J' + args.component}"
-                   f"[hbar]  ({dos_source}-derived)")
-            np.savetxt(args.dos_out,
-                       np.column_stack([grid, dos_vals, dos_col]),
-                       delimiter=",", header=hdr, comments="# ")
-            print(f"Saved DOS data to {args.dos_out}")
+            _write_dos_csv(args.dos_out, edges, dos_vals, dos_col, args,
+                           dos_source)
 
     plot_band_chirality(
         info["distances"], freqs, color,
