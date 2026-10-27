@@ -159,6 +159,18 @@ python plot_chiral_bands.py band.hdf5 --component z --unit meV --ylim 0 50
 
 `band.yaml` files are also accepted (run Phonopy with `EIGENVECTORS = .TRUE.`); the parsed arrays are cached to `band.yaml.npz`, so later runs skip the slow YAML parser.
 
+Figures are saved at 300 dpi; `--dpi 600` doubles the resolution, and an output name ending in `.pdf` or `.svg` (`-o band_chirality.pdf`) gives vector graphics.
+
+### Many calculations at once
+
+`plot_all.sh` runs the plotting script in every directory below a starting point that contains `band.hdf5` or `band.yaml` (preferring `band.hdf5`), with `--dos --ylim -10 50` by default. Each figure is written next to its input, directories are processed one at a time, and failures are listed at the end without stopping the run. Further options are added after the defaults, and a repeated option overrides the default:
+
+```bash
+./plot_all.sh results --dpi 600 --dos-scale separate --ylim 0 30
+```
+
+The script looks for `plot_chiral_bands.py` in `~/python/phonopy-chirality/`; set `PLOT_SCRIPT` to use another copy.
+
 ### Colour scale
 
 Phonon angular momentum is usually concentrated near zero with a thin tail of strongly chiral modes, which leaves almost every band in the darkest part of a linear 0–1 colour scale. The script prints the percentiles of the data on every run so that limits can be chosen sensibly:
@@ -170,6 +182,8 @@ Phonon angular momentum is usually concentrated near zero with a thin tail of st
 | `--cscale power --cgamma 0.4` | Power-law mapping that expands the low-$J$ end; symmetric about zero for signed components |
 | `--cscale log` | Logarithmic (or symmetric-logarithmic) mapping |
 | `--cmap` | Any Matplotlib colormap |
+
+The DOS shares the band colour scale by default. Bin means are averages over many modes and so span a narrower range than individual modes; `--dos-scale separate` gives the DOS its own limits, from the range of the bin means, its own palette (magma for $\|\mathbf{J}\|$, purple–orange for signed components) and its own colourbar, laid out as [bands | band colourbar | DOS | DOS colourbar]. `--dos-vmin`, `--dos-vmax` and `--dos-cmap` set the DOS limits and palette explicitly.
 
 Data-driven limits are ignored when the angular momentum is below $10^{-6}\,\hbar$ everywhere, as in centrosymmetric crystals, where every mode is achiral; rescaling would otherwise render rounding noise as chirality.
 
@@ -184,11 +198,15 @@ Data-driven limits are ignored when the angular momentum is below $10^{-6}\,\hba
 | `--no-sort-freq` | off | Keep Phonopy's band connection instead of sorting modes by frequency at each q-point |
 | `--dos`, `--dos-only` | off | DOS side panel, or a DOS-only figure |
 | `--mesh MESH_HDF5` | auto | Mesh file for the DOS |
+| `--dos-scale {shared,separate}` | `shared` | Colour the DOS on the band scale, or on its own scale and palette with a second colourbar |
+| `--dos-vmin`, `--dos-vmax` | from data | DOS colour limits (imply `--dos-scale separate`) |
+| `--dos-cmap` | `magma` / `PuOr` | DOS colour palette (implies `--dos-scale separate`) |
 | `--dos-bins N` | 150 | Number of histogram bins across the frequency range (the `--ylim` window if given) |
 | `--dos-binwidth W` | – | Bin width in the chosen frequency unit; overrides `--dos-bins` |
 | `--dos-out CSV` | – | Write bin edges, DOS and mean chirality per bin to CSV |
 | `--no-degen-zero`, `--degen-tol` | off, 1e-5 | Degeneracy handling |
-| `--fontsize`, `--linewidth`, `--dpi` | 16, 1.5, 300 | Figure styling |
+| `--dpi` | 300 | Image resolution |
+| `--fontsize`, `--linewidth` | 16, 1.5 | Figure styling |
 | `--no-cache` | off | Do not read or write the `band.yaml.npz` cache |
 | `-o FILE` | `band_chirality.png` | Output figure |
 

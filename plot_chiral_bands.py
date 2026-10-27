@@ -726,6 +726,32 @@ def _colour_limits(absv, args, signed):
     return vmin, vmax
 
 
+def _dos_colour_limits(mean, args, signed):
+    """Colour limits for a DOS on its own scale: --dos-vmin/--dos-vmax, else
+    the range of the per-bin means (symmetric about zero for signed data)."""
+    finite = np.abs(mean[np.isfinite(mean)])
+    auto = float(finite.max()) if finite.size else 0.0
+    if auto < _J_NOISE_FLOOR:
+        auto = 1.0
+    vmax = args.dos_vmax if args.dos_vmax is not None else auto
+    vmin = args.dos_vmin if args.dos_vmin is not None else (-abs(vmax) if signed else 0.0)
+    return vmin, vmax
+
+
+def _separate_dos_scale(args):
+    return args.dos_scale == "separate" or args.dos_vmin is not None \
+        or args.dos_vmax is not None or args.dos_cmap is not None
+
+
+def _dos_cmap(args, band_cmap, signed):
+    """DOS palette for a separate scale: --dos-cmap, else one distinct from
+    the band palette (magma for |J|, PuOr for signed components)."""
+    if args.dos_cmap is not None:
+        return args.dos_cmap
+    default, alternative = ("PuOr", "bwr") if signed else ("magma", "viridis")
+    return default if band_cmap != default else alternative
+
+
 def make_norm(vmin, vmax, *, scale="linear", gamma=0.5, signed=False,
               linthresh_frac=0.02):
     """Build a matplotlib colour norm.
@@ -807,6 +833,9 @@ def plot_band_chirality(
     dos=None,
     dos_label="DOS",
     norm=None,
+    dos_norm=None,
+    dos_colorbar_label=None,
+    dos_cmap=None,
 ):
     """Render the band structure, coloring each band by ``color_values``.
 
@@ -814,6 +843,11 @@ def plot_band_chirality(
     returned by :func:`compute_chirality_histogram`; it is drawn as a
     histogram side panel sharing the frequency axis, each bar filled with the
     mean angular momentum of the modes in it.
+
+    With ``dos_norm`` the DOS is coloured on its own scale, in ``dos_cmap``
+    (default ``cmap``), and each panel gets its own colourbar on its right:
+    [bands | band colourbar | DOS | DOS colourbar]. Otherwise bands and DOS
+    share ``norm`` and one colourbar.
     """
     nqpt, nband = frequencies.shape
 
@@ -824,15 +858,28 @@ def plot_band_chirality(
             vmax = float(np.max(color_values))
         norm = plt.Normalize(vmin, vmax)
 
+    separate = dos is not None and dos_norm is not None
+    cax_bands = cax_dos = None
     if dos is None:
         fig, ax = plt.subplots(figsize=figsize)
         ax_dos = None
-    else:
+    elif not separate:
         fig, (ax, ax_dos) = plt.subplots(
             1, 2, figsize=(figsize[0] * 1.28, figsize[1]),
             sharey=True,
             gridspec_kw={"width_ratios": [3.2, 1.0], "wspace": 0.04},
         )
+    else:
+        # [bands | band colourbar | DOS | DOS colourbar]; the empty columns
+        # leave room for the colourbar ticks and labels.
+        fig = plt.figure(figsize=(figsize[0] * 1.45, figsize[1]))
+        gs = fig.add_gridspec(1, 7, wspace=0.0,
+                              width_ratios=[3.2, 0.06, 0.09, 0.55, 1.0, 0.07, 0.09])
+        ax = fig.add_subplot(gs[0])
+        cax_bands = fig.add_subplot(gs[2])
+        ax_dos = fig.add_subplot(gs[4], sharey=ax)
+        cax_dos = fig.add_subplot(gs[6])
+        ax_dos.tick_params(axis="y", labelleft=False)
 
     # Segment starts so we don't draw across path discontinuities
     seg_starts, idx = [], 0
@@ -878,8 +925,9 @@ def plot_band_chirality(
     # DOS side panel, coloured by the DOS-weighted mean angular momentum
     if ax_dos is not None:
         edges, dos_vals, dos_col = dos
-        _draw_chirality_histogram(ax_dos, edges, dos_vals, dos_col, cmap, norm,
-                                  horizontal=True)
+        _draw_chirality_histogram(ax_dos, edges, dos_vals, dos_col,
+                                  (dos_cmap or cmap) if separate else cmap,
+                                  dos_norm if separate else norm, horizontal=True)
 
         ax_dos.set_xlim(0, float(np.max(dos_vals)) * 1.08 or 1.0)
         ax_dos.set_xlabel(dos_label, fontsize=fontsize)
@@ -888,13 +936,24 @@ def plot_band_chirality(
         ax_dos.axhline(0, color="k", linewidth=0.5)
         ax_dos.grid(axis="x", alpha=0.25)
 
-    # Colorbar
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    sm.set_array([])
-    cbar_ax = ax if ax_dos is None else [ax, ax_dos]
-    cbar = plt.colorbar(sm, ax=cbar_ax)
-    cbar.set_label(colorbar_label, rotation=270, labelpad=24, fontsize=fontsize)
-    cbar.ax.tick_params(labelsize=fontsize - 2)
+    # Colourbars
+    def _colourbar(nrm, cm, label, **where):
+        sm = plt.cm.ScalarMappable(cmap=cm, norm=nrm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, **where)
+        cbar.set_label(label, rotation=270, labelpad=24, fontsize=fontsize)
+        cbar.ax.tick_params(labelsize=fontsize - 2)
+        return cbar
+
+    if separate:
+        for cax, title in ((cax_bands, "Bands"), (cax_dos, "DOS")):
+            cax.set_title(title, fontsize=fontsize - 2, pad=8)
+        _colourbar(norm, cmap, colorbar_label, cax=cax_bands)
+        _colourbar(dos_norm, dos_cmap or cmap, dos_colorbar_label or colorbar_label,
+                   cax=cax_dos)
+    else:
+        _colourbar(norm, cmap, colorbar_label,
+                   ax=ax if ax_dos is None else [ax, ax_dos])
 
     if ax_dos is None:
         fig.tight_layout()
@@ -944,7 +1003,7 @@ def _dos_only_main(args):
         color = chi[..., {"x": 0, "y": 1, "z": 2}[args.component]]
         cb_label = rf"$J_{args.component}\ [\hbar]$"
         default_cmap = "bwr"
-    cmap = args.cmap if args.cmap is not None else default_cmap
+    cmap = args.dos_cmap or (args.cmap if args.cmap is not None else default_cmap)
     signed = args.component != "total"
 
     freqs = mesh["frequencies"] * THZ_TO[args.unit]
@@ -967,6 +1026,13 @@ def _dos_only_main(args):
     )
     if args.dos_out:
         _write_dos_csv(args.dos_out, edges, dos_vals, dos_col, args, "mesh")
+    if _separate_dos_scale(args):
+        vmin, vmax = _dos_colour_limits(dos_col, args, signed)
+        norm = make_norm(vmin, vmax, scale=args.cscale, gamma=args.cgamma,
+                         signed=signed)
+        cb_label = (r"$\langle\|\mathbf{J}\|\rangle\ [\hbar]$" if not signed
+                    else rf"$\langle J_{args.component}\rangle\ [\hbar]$")
+        print(f"  DOS colour range: [{vmin:.4g}, {vmax:.4g}]  (separate scale)")
 
     fig, ax = plt.subplots(figsize=(7, 6))
     _draw_chirality_histogram(ax, edges, dos_vals, dos_col, cmap, norm,
@@ -1070,6 +1136,19 @@ def main(argv=None):
     p.add_argument("--dos-binwidth", type=float, default=None,
                    help="DOS histogram bin width in the plot's frequency "
                         "unit; overrides --dos-bins.")
+    p.add_argument("--dos-scale", choices=["shared", "separate"], default="shared",
+                   help="Colour scale for the DOS. 'shared' (default) uses the "
+                        "band colour scale and one colourbar; 'separate' gives "
+                        "the DOS its own limits, from the range of the per-bin "
+                        "means, its own palette and its own colourbar.")
+    p.add_argument("--dos-cmap", default=None,
+                   help="Colour palette for the DOS; implies --dos-scale "
+                        "separate. Default on a separate scale: 'magma' for "
+                        "|J|, 'PuOr' for signed components.")
+    p.add_argument("--dos-vmin", type=float, default=None,
+                   help="Lower DOS colour limit; implies --dos-scale separate.")
+    p.add_argument("--dos-vmax", type=float, default=None,
+                   help="Upper DOS colour limit; implies --dos-scale separate.")
     p.add_argument("--dos-only", action="store_true",
                    help="Plot only the chirality-coloured DOS (no band "
                         "panel). Implied when a mesh.hdf5 is given as the "
@@ -1175,6 +1254,7 @@ def main(argv=None):
 
     # ---------------------------------------------------------------- DOS
     dos_tuple = None
+    dos_norm = None
     if args.dos or args.mesh or args.dos_out:
         if args.mesh:
             mesh = load_mesh_file(args.mesh)
@@ -1206,6 +1286,11 @@ def main(argv=None):
             binwidth=args.dos_binwidth, frange=args.ylim,
         )
         dos_tuple = (edges, dos_vals, dos_col)
+        if _separate_dos_scale(args):
+            d_vmin, d_vmax = _dos_colour_limits(dos_col, args, signed)
+            dos_norm = make_norm(d_vmin, d_vmax, scale=args.cscale,
+                                 gamma=args.cgamma, signed=signed)
+            print(f"  DOS colour range: [{d_vmin:.4g}, {d_vmax:.4g}]  (separate scale)")
         if args.dos_out:
             _write_dos_csv(args.dos_out, edges, dos_vals, dos_col, args,
                            dos_source)
@@ -1221,6 +1306,11 @@ def main(argv=None):
         dos=dos_tuple,
         dos_label=("DOS" if dos_tuple is None or dos_source == "mesh"
                    else "Path DOS"),
+        dos_norm=dos_norm,
+        dos_cmap=_dos_cmap(args, cmap, signed) if dos_norm is not None else None,
+        dos_colorbar_label=(r"$\langle\|\mathbf{J}\|\rangle\ [\hbar]$"
+                            if args.component == "total"
+                            else rf"$\langle J_{args.component}\rangle\ [\hbar]$"),
     )
 
 
