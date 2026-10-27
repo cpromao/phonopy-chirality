@@ -67,7 +67,7 @@ phonopy-load phonopy_params.yaml --config mesh.conf    # writes mesh.hdf5
 
 `BAND_LABELS` must contain exactly one label per breakpoint of the path: one per point, counting both sides of a discontinuity (the comma in `BAND`). If the count is wrong, Phonopy drops the labels without warning; `--labels` in the plotting script supplies them afterwards.
 
-Mesh eigenvectors occupy $N_q \times (3N_\mathrm{atom})^2$ complex numbers over the irreducible q-points; for a 30-atom orthorhombic cell a 30×30×30 mesh needs roughly 450 MB, and a 16×16×16 mesh (about 70 MB) is usually sufficient for the DOS.
+Mesh eigenvectors occupy $N_q \times (3N_\mathrm{atom})^2$ complex numbers over the irreducible q-points; for a 30-atom orthorhombic cell a 30×30×30 mesh takes roughly 450 MB on disk, and a 16×16×16 mesh (about 70 MB) is usually sufficient for the DOS. The plotting script's memory use does not depend on this size (see the implementation notes).
 
 ### Python API
 
@@ -197,4 +197,5 @@ Labels are converted to LaTeX (`GAMMA` and `$\Gamma$` → $\Gamma$, `SIGMA_0` �
 ## Implementation notes
 
 - Phonopy stores HDF5 eigenvectors as a complex matrix per q-point, with shape `(npath, nqpp, 3N, 3N)` for bands and `(nq, 3N, 3N)` for the mesh, and with **modes as columns**. The YAML layout differs.
+- Eigenvectors are read from HDF5 in blocks of about 64 MB and reduced to angular momenta as they are read, so memory use stays at a few hundred megabytes however large `band.hdf5` or `mesh.hdf5` is. `band.yaml` input is still parsed whole by PyYAML, which takes several times the file size in memory; prefer HDF5 for large cells.
 - `is_band_connection=True` can mis-assign bands in crowded spectra, producing spurious crossings. The plotting script sorts modes by frequency at each q-point by default, carrying each mode's angular momentum with it.

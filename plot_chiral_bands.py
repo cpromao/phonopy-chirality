@@ -85,16 +85,20 @@ def _extract_yaml(data: dict) -> dict:
 
     distances = np.empty(nqpt)
     frequencies = np.empty((nqpt, nband))                       # THz
-    eigvecs = np.empty((nqpt, nband, natom, 3), dtype=complex)  # dyn-mat evecs
+    chi = np.empty((nqpt, nband, 3))
     qpoints = np.empty((nqpt, 3))
 
+    # Reduce each q-point's eigenvectors to angular momenta immediately, so
+    # the full eigenvector array is never held in memory.
+    ev = np.empty((1, nband, natom, 3), dtype=complex)
     for iq, ph in enumerate(phonons):
         distances[iq] = ph["distance"]
         qpoints[iq] = ph["q-position"]
         for ib, b in enumerate(ph["band"]):
             frequencies[iq, ib] = b["frequency"]
-            ev = np.asarray(b["eigenvector"])      # (natom, 3, 2)  -> (Re, Im)
-            eigvecs[iq, ib] = ev[..., 0] + 1j * ev[..., 1]
+            e = np.asarray(b["eigenvector"])       # (natom, 3, 2)  -> (Re, Im)
+            ev[0, ib] = e[..., 0] + 1j * e[..., 1]
+        chi[iq] = compute_chirality(ev)[0][0]
 
     return {
         "natom": natom,
@@ -102,7 +106,8 @@ def _extract_yaml(data: dict) -> dict:
         "nband": nband,
         "distances": distances,
         "frequencies": frequencies,
-        "eigvecs": eigvecs,
+        "chi": chi,
+        "chi_total": np.linalg.norm(chi, axis=-1),
         "qpoints": qpoints,
         "segment_nqpoint": data.get("segment_nqpoint", [nqpt]),
         "labels": data.get("labels", None),
@@ -124,6 +129,57 @@ def _load_yaml(filename: str | Path) -> dict:
         return yaml.load(f, Loader=_YAML_LOADER)
 
 
+# Eigenvector data read from HDF5 per block. Peak memory is a small multiple
+# of this, independent of the number of q-points.
+_CHUNK_BYTES = 64 * 2**20
+
+
+def _chirality_from_matrix(ev: np.ndarray) -> np.ndarray:
+    """Angular momenta from Phonopy eigenvector matrices.
+
+    ``ev`` has shape (k, 3N, 3N): rows are atomic Cartesian degrees of
+    freedom (3*atom + d), columns are modes. Returns (k, 3N, 3) with
+    J_d = 2 Im sum_atom conj(xi_{atom,d1}) xi_{atom,d2} for each mode.
+    """
+    k, n, _ = ev.shape
+    e = ev.reshape(k, n // 3, 3, n)              # (k, atom, d, mode)
+    chi = np.empty((k, n, 3))
+    for d in range(3):
+        d1, d2 = (d + 1) % 3, (d + 2) % 3
+        chi[:, :, d] = 2.0 * (np.conj(e[:, :, d1, :]) * e[:, :, d2, :]).imag.sum(axis=1)
+    return chi
+
+
+def _stream_chirality(ds, nlead: int) -> np.ndarray:
+    """Angular momenta from an HDF5 eigenvector dataset, read block by block.
+
+    ``ds`` has ``nlead`` leading q-point axes followed by the (3N, 3N) matrix,
+    either complex or packed as a trailing (Re, Im) axis of length 2. Returns
+    an array of shape ``ds.shape[:nlead] + (3N, 3)``.
+    """
+    shape = tuple(ds.shape)
+    packed = not np.issubdtype(ds.dtype, np.complexfloating)
+    if len(shape) != nlead + 2 + int(packed) or (packed and shape[-1] != 2) \
+            or shape[nlead] != shape[nlead + 1]:
+        raise ValueError(
+            f"Unexpected eigenvector dataset: dtype {ds.dtype}, shape {shape}. "
+            f"Expected {nlead} q-point axes followed by a square (3N, 3N) "
+            f"complex matrix (or a trailing (Re, Im) axis of length 2)."
+        )
+    n = shape[nlead]
+    lead = shape[:nlead]
+    chi = np.empty(lead + (n, 3))
+    step = max(1, _CHUNK_BYTES // (n * n * 16))
+    for outer in np.ndindex(*lead[:-1]):
+        for i in range(0, lead[-1], step):
+            idx = outer + (slice(i, min(lead[-1], i + step)),)
+            block = ds[idx]
+            if packed:
+                block = block[..., 0] + 1j * block[..., 1]
+            chi[idx] = _chirality_from_matrix(block)
+    return chi
+
+
 def _load_hdf5(filename: str | Path) -> dict:
     """Read a Phonopy ``band.hdf5`` file and return the standard info dict.
 
@@ -139,13 +195,10 @@ def _load_hdf5(filename: str | Path) -> dict:
         path        : (npath, nqpp, 3)                             real
         label       : (npath, 2)  bytes  (optional)
 
-    Modern h5py versions deserialize the complex eigenvector dataset to a
-    complex numpy array directly. A few older combinations write a real
-    array with a trailing length-2 (Re, Im) axis instead, and we handle
-    that as a fallback.
-
-    The function flattens the path dimension so the returned arrays match
-    the (nqpt, ...) layout used by the rest of the script.
+    The eigenvectors are read block by block and reduced to angular momenta
+    as they are read, so memory use does not grow with the file size.
+    Arrays are returned flattened over the path to the (nqpt, ...) layout
+    used by the rest of the script.
     """
     if not _HAS_H5PY:
         raise ImportError(
@@ -162,7 +215,6 @@ def _load_hdf5(filename: str | Path) -> dict:
             )
 
         freq = np.asarray(f["frequency"])
-        ev_raw = np.asarray(f["eigenvector"])
         dist = np.asarray(f["distance"])
         path = np.asarray(f["path"])
         # `label` is sometimes a length-0 dataset when no labels were set
@@ -175,46 +227,17 @@ def _load_hdf5(filename: str | Path) -> dict:
         else:
             seg_nqpoint = None
 
-    npath, nqpp, nband = freq.shape
+        npath, nqpp, nband = freq.shape
+        chi = _stream_chirality(f["eigenvector"], nlead=2)
 
-    # --- bring eigenvector array to complex form ------------------------- #
-    if np.iscomplexobj(ev_raw):
-        ev_complex = ev_raw
-    elif ev_raw.shape[-1] == 2:
-        ev_complex = ev_raw[..., 0] + 1j * ev_raw[..., 1]
-    else:
+    if chi.shape[2] != nband:
         raise ValueError(
-            f"Cannot interpret eigenvector dataset of dtype {ev_raw.dtype} "
-            f"and shape {ev_raw.shape}. Expected either a complex array of "
-            f"shape (npath, nqpp, natom*3, natom*3), or a real array of "
-            f"shape (..., 2) packing (Re, Im) along the last axis."
-        )
-
-    # --- check the matrix layout matches our expectation ----------------- #
-    if ev_complex.ndim != 4 or ev_complex.shape[2] != ev_complex.shape[3]:
-        raise ValueError(
-            f"Unexpected eigenvector array shape {ev_complex.shape}. "
-            f"Expected (npath, nqpp, natom*3, natom*3)."
-        )
-    natom_x3 = ev_complex.shape[2]
-    if natom_x3 != nband:
-        raise ValueError(
-            f"Eigenvector matrix size {natom_x3} does not match number of "
+            f"Eigenvector matrix size {chi.shape[2]} does not match number of "
             f"bands {nband}; cannot determine natom."
         )
-    natom = natom_x3 // 3
 
-    # --- transpose mode axis into front, then split atomic dof into (atom, 3)
-    # ev_complex is (npath, nqpp, atomic_dof, mode); swap last two so mode comes first
-    ev_complex = np.transpose(ev_complex, (0, 1, 3, 2))
-    ev_complex = ev_complex.reshape(npath, nqpp, nband, natom, 3)
-
-    # --- flatten path dimension to the (nqpt, ...) layout ---------------- #
     nqpt = npath * nqpp
-    distances = dist.reshape(nqpt)
-    frequencies = freq.reshape(nqpt, nband)
-    eigvecs = ev_complex.reshape(nqpt, nband, natom, 3)
-    qpoints = path.reshape(nqpt, 3)
+    chi = chi.reshape(nqpt, nband, 3)
 
     if label_arr is not None:
         labels = [[label_arr[i, 0].decode(), label_arr[i, 1].decode()]
@@ -223,29 +246,34 @@ def _load_hdf5(filename: str | Path) -> dict:
         labels = None
 
     return {
-        "natom": natom,
+        "natom": nband // 3,
         "nqpt": nqpt,
         "nband": nband,
-        "distances": distances,
-        "frequencies": frequencies,
-        "eigvecs": eigvecs,
-        "qpoints": qpoints,
+        "distances": dist.reshape(nqpt),
+        "frequencies": freq.reshape(nqpt, nband),
+        "chi": chi,
+        "chi_total": np.linalg.norm(chi, axis=-1),
+        "qpoints": path.reshape(nqpt, 3),
         "segment_nqpoint": seg_nqpoint if seg_nqpoint is not None
                            else [nqpp] * npath,
         "labels": labels,
     }
 
 
+_CACHE_VERSION = 2   # v1 stored full eigenvectors; v2 stores angular momenta
+
+
 def _save_npz_cache(info: dict, cache_path: Path) -> None:
-    """Write the parsed arrays to a compressed .npz for fast reload."""
+    """Write the parsed arrays to an .npz for fast reload."""
     labels_arr = (np.array(info["labels"], dtype=object)
                   if info["labels"] is not None else None)
     np.savez(
         cache_path,
+        cache_version=_CACHE_VERSION,
         natom=info["natom"], nqpt=info["nqpt"], nband=info["nband"],
         distances=info["distances"],
         frequencies=info["frequencies"],
-        eigvecs=info["eigvecs"],
+        chi=info["chi"],
         qpoints=info["qpoints"],
         segment_nqpoint=np.asarray(info["segment_nqpoint"]),
         labels=labels_arr if labels_arr is not None else np.array([], dtype=object),
@@ -256,14 +284,18 @@ def _save_npz_cache(info: dict, cache_path: Path) -> None:
 def _load_npz_cache(cache_path: Path) -> dict:
     """Read a cached .npz produced by ``_save_npz_cache``."""
     with np.load(cache_path, allow_pickle=True) as z:
+        if "cache_version" not in z or int(z["cache_version"]) != _CACHE_VERSION:
+            raise ValueError("cache written by an older version")
         labels = z["labels"].tolist() if bool(z["has_labels"]) else None
+        chi = z["chi"]
         return {
             "natom": int(z["natom"]),
             "nqpt": int(z["nqpt"]),
             "nband": int(z["nband"]),
             "distances": z["distances"],
             "frequencies": z["frequencies"],
-            "eigvecs": z["eigvecs"],
+            "chi": chi,
+            "chi_total": np.linalg.norm(chi, axis=-1),
             "qpoints": z["qpoints"],
             "segment_nqpoint": z["segment_nqpoint"].tolist(),
             "labels": labels,
@@ -287,8 +319,11 @@ def load_mesh_file(filename: str | Path, *, verbose: bool = True) -> dict:
         weight      : (nqpt,)                           int   symmetry weights
         qpoint      : (nqpt, 3)                         real
 
-    Returns a dict with ``frequencies``, ``eigvecs`` (nqpt, nband, natom, 3),
-    and ``weights`` (nqpt,).
+    The eigenvectors are read block by block and reduced to angular momenta
+    as they are read, so memory use does not grow with the mesh size.
+
+    Returns a dict with ``frequencies``, ``chi`` (nqpt, nband, 3),
+    ``chi_total`` (nqpt, nband) and ``weights`` (nqpt,).
     """
     if not _HAS_H5PY:
         raise ImportError(
@@ -309,38 +344,25 @@ def load_mesh_file(filename: str | Path, *, verbose: bool = True) -> dict:
                 f"in run_mesh()."
             )
         freq = np.asarray(f["frequency"])
-        ev_raw = np.asarray(f["eigenvector"])
         weights = (np.asarray(f["weight"]).astype(float) if "weight" in f
                    else np.ones(freq.shape[0]))
         qpoints = np.asarray(f["qpoint"]) if "qpoint" in f else None
+        chi = _stream_chirality(f["eigenvector"], nlead=1)
 
     nqpt, nband = freq.shape
-
-    if np.iscomplexobj(ev_raw):
-        ev = ev_raw
-    elif ev_raw.shape[-1] == 2:
-        ev = ev_raw[..., 0] + 1j * ev_raw[..., 1]
-    else:
+    if chi.shape[1] != nband:
         raise ValueError(
-            f"Cannot interpret mesh eigenvector dataset with dtype "
-            f"{ev_raw.dtype} and shape {ev_raw.shape}."
+            f"Mesh eigenvector matrix size {chi.shape[1]} does not match the "
+            f"number of bands {nband}."
         )
-
-    if ev.ndim != 3 or ev.shape[1] != ev.shape[2]:
-        raise ValueError(
-            f"Unexpected mesh eigenvector shape {ev.shape}; expected "
-            f"(nqpt, natom*3, natom*3)."
-        )
-    natom = ev.shape[1] // 3
-    # columns are modes -> move mode axis in front of the atomic-dof axis
-    ev = np.transpose(ev, (0, 2, 1)).reshape(nqpt, nband, natom, 3)
 
     return {
-        "natom": natom,
+        "natom": nband // 3,
         "nqpt": nqpt,
         "nband": nband,
         "frequencies": freq,
-        "eigvecs": ev,
+        "chi": chi,
+        "chi_total": np.linalg.norm(chi, axis=-1),
         "weights": weights,
         "qpoints": qpoints,
     }
@@ -398,12 +420,12 @@ def load_band_file(filename: str | Path, *, use_cache: bool = True,
 # --------------------------------------------------------------------------- #
 # Chirality
 # --------------------------------------------------------------------------- #
-def compute_chirality(eigvecs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Phonon angular momentum for every (q-point, band).
+def compute_chirality(eigvecs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    r"""Phonon angular momentum for every (q-point, band).
 
-    For each atom :math:`\\alpha` and Cartesian direction :math:`d`:
+    For each Cartesian direction :math:`d`:
 
-    .. math::  S_d^\\alpha = 2\\,\\mathrm{Im}(\\xi^*_{\\alpha,d_1}\\xi_{\\alpha,d_2})
+    .. math::  J_d = \sum_\alpha 2\,\mathrm{Im}(\xi^*_{\alpha,d_1}\xi_{\alpha,d_2})
 
     with :math:`(d_1,d_2)` the cyclic perpendicular pair to :math:`d`.
 
@@ -416,30 +438,20 @@ def compute_chirality(eigvecs: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.n
     -------
     chi       : ndarray (nqpt, nband, 3)        components in units of hbar
     chi_total : ndarray (nqpt, nband)           Euclidean norm of chi
-    S         : ndarray (nqpt, nband, 3, natom) per-atom contributions
     """
-    nqpt, nband, natom, _ = eigvecs.shape
-    S = np.empty((nqpt, nband, 3, natom))
-
+    chi = np.empty(eigvecs.shape[:2] + (3,))
     for d in range(3):
-        d1 = (d + 1) % 3
-        d2 = (d + 2) % 3
-        S[:, :, d, :] = 2.0 * np.imag(
-            np.conj(eigvecs[..., d1]) * eigvecs[..., d2]
-        )
-
-    chi = S.sum(axis=-1)
-    chi_total = np.linalg.norm(chi, axis=-1)
-    return chi, chi_total, S
+        d1, d2 = (d + 1) % 3, (d + 2) % 3
+        chi[..., d] = 2.0 * (np.conj(eigvecs[..., d1]) * eigvecs[..., d2]).imag.sum(axis=-1)
+    return chi, np.linalg.norm(chi, axis=-1)
 
 
 def zero_degenerate(
     frequencies: np.ndarray,
     chi: np.ndarray,
     chi_total: np.ndarray,
-    S: np.ndarray,
     tol: float = 1e-5,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Set the chirality of (near-)degenerate modes to zero.
 
     Within a degenerate subspace the individual eigenvectors are not unique
@@ -447,37 +459,32 @@ def zero_degenerate(
     momentum is gauge-dependent and not physically meaningful. Following the
     original MATLAB script we suppress those values.
 
-    ``tol`` is a *relative* tolerance, with an absolute floor of 1 (so that
-    near-zero acoustic frequencies at Gamma aren't all flagged as degenerate
-    with each other through round-off only).
+    A mode is degenerate when its frequency lies within ``tol * max(|f|, 1)``
+    of the next mode up or down in frequency; the absolute floor of 1 keeps
+    near-zero acoustic frequencies at Gamma from all being flagged through
+    round-off. Neighbours are taken in frequency order, so the result does
+    not depend on how the bands are ordered.
     """
-    chi = chi.copy()
-    chi_total = chi_total.copy()
-    S = S.copy()
-    nqpt, nband = frequencies.shape
+    order = np.argsort(frequencies, axis=1)
+    f = np.take_along_axis(frequencies, order, axis=1)
+    gap = np.abs(np.diff(f, axis=1))                     # (nqpt, nband - 1)
+    scale = tol * np.maximum(np.abs(f), 1.0)
+    degen_sorted = np.zeros(f.shape, dtype=bool)
+    degen_sorted[:, 1:] |= gap < scale[:, 1:]            # close to the mode below
+    degen_sorted[:, :-1] |= gap < scale[:, :-1]          # close to the mode above
+    degen = np.empty_like(degen_sorted)
+    np.put_along_axis(degen, order, degen_sorted, axis=1)
 
-    for iq in range(nqpt):
-        for ib in range(nband):
-            f = frequencies[iq, ib]
-            scale = max(abs(f), 1.0)
-            is_degen = False
-            if ib > 0 and abs(f - frequencies[iq, ib - 1]) < tol * scale:
-                is_degen = True
-            if ib + 1 < nband and abs(f - frequencies[iq, ib + 1]) < tol * scale:
-                is_degen = True
-            if is_degen:
-                chi[iq, ib, :] = 0.0
-                chi_total[iq, ib] = 0.0
-                S[iq, ib, :, :] = 0.0
-    return chi, chi_total, S
+    chi = np.where(degen[..., None], 0.0, chi)
+    chi_total = np.where(degen, 0.0, chi_total)
+    return chi, chi_total
 
 
 def sort_modes_by_frequency(
     frequencies: np.ndarray,
     chi: np.ndarray,
     chi_total: np.ndarray,
-    S: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reorder bands so that at each q-point band index = frequency rank.
 
     Phonopy's ``is_band_connection=True`` tries to track band identity across
@@ -493,12 +500,9 @@ def sort_modes_by_frequency(
     actually lives there.
     """
     order = np.argsort(frequencies, axis=1)
-    f_sorted = np.take_along_axis(frequencies, order, axis=1)
-    chit_sorted = np.take_along_axis(chi_total, order, axis=1)
-    chi_sorted = np.take_along_axis(chi, order[..., None], axis=1)
-    # S has shape (nqpt, nband, 3, natom): use broadcasting on the band axis
-    S_sorted = np.take_along_axis(S, order[..., None, None], axis=1)
-    return f_sorted, chi_sorted, chit_sorted, S_sorted
+    return (np.take_along_axis(frequencies, order, axis=1),
+            np.take_along_axis(chi, order[..., None], axis=1),
+            np.take_along_axis(chi_total, order, axis=1))
 
 
 def compute_chirality_histogram(
@@ -927,10 +931,10 @@ def _dos_only_main(args):
     mesh = load_mesh_file(args.mesh)
     print(f"  mesh: nqpt = {mesh['nqpt']}, nband = {mesh['nband']}")
 
-    chi, chit, S = compute_chirality(mesh["eigvecs"])
+    chi, chit = mesh["chi"], mesh["chi_total"]
     if not args.no_degen_zero:
-        chi, chit, S = zero_degenerate(mesh["frequencies"], chi, chit, S,
-                                       tol=args.degen_tol)
+        chi, chit = zero_degenerate(mesh["frequencies"], chi, chit,
+                                    tol=args.degen_tol)
 
     if args.component == "total":
         color = chit
@@ -1120,16 +1124,15 @@ def main(argv=None):
         info["labels"] = [[user_labels[i], user_labels[i + 1]]
                           for i in range(npath)]
 
-    print("Computing chirality ...")
-    chi, chi_total, S = compute_chirality(info["eigvecs"])
+    chi, chi_total = info["chi"], info["chi_total"]
     if not args.no_sort_freq:
         print("  sorting modes by frequency at each q-point")
-        info["frequencies"], chi, chi_total, S = sort_modes_by_frequency(
-            info["frequencies"], chi, chi_total, S,
+        info["frequencies"], chi, chi_total = sort_modes_by_frequency(
+            info["frequencies"], chi, chi_total,
         )
     if not args.no_degen_zero:
-        chi, chi_total, S = zero_degenerate(
-            info["frequencies"], chi, chi_total, S, tol=args.degen_tol,
+        chi, chi_total = zero_degenerate(
+            info["frequencies"], chi, chi_total, tol=args.degen_tol,
         )
 
     # Pick component to color by
@@ -1176,11 +1179,10 @@ def main(argv=None):
         if args.mesh:
             mesh = load_mesh_file(args.mesh)
             print(f"  mesh: nqpt = {mesh['nqpt']}, nband = {mesh['nband']}")
-            m_chi, m_chit, m_S = compute_chirality(mesh["eigvecs"])
+            m_chi, m_chit = mesh["chi"], mesh["chi_total"]
             if not args.no_degen_zero:
-                m_chi, m_chit, m_S = zero_degenerate(
-                    mesh["frequencies"], m_chi, m_chit, m_S,
-                    tol=args.degen_tol,
+                m_chi, m_chit = zero_degenerate(
+                    mesh["frequencies"], m_chi, m_chit, tol=args.degen_tol,
                 )
             if args.component == "total":
                 m_color = m_chit
